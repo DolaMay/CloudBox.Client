@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="CloudBox.Client.MainPage">
+    <VerticalStackLayout Padding="24" Spacing="16">
+        <Label Text="CloudBox 备份" FontSize="24" FontAttributes="Bold" />
+        <Entry x:Name="ServerUrlEntry" Placeholder="http://192.168.1.10:5080" />
+        <Entry x:Name="ApiKeyEntry" Placeholder="dev-key-change-me" IsPassword="True" />
+        <Button x:Name="BackupButton" Text="开始扫描并备份" Clicked="OnBackupClicked" />
+        <Button x:Name="CancelButton" Text="取消" Clicked="OnCancelClicked" IsEnabled="False" />
+        <ProgressBar x:Name="ProgressBar" />
+        <Label x:Name="StatusLabel" LineBreakMode="WordWrap" />
+    </VerticalStackLayout>
+</ContentPage>
