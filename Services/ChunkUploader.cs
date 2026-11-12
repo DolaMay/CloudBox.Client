@@ -10,6 +10,8 @@ public class ChunkUploader
 {
     private readonly HttpClient _http;
     private const int ChunkSize = 4 * 1024 * 1024;
+    private const long SmallFileThreshold = 16L * 1024 * 1024;  // 16 MB
+    private const int MaxConcurrentChunks = 4;
 
     public ChunkUploader(string baseUrl, string apiKey)
     {
@@ -18,7 +20,70 @@ public class ChunkUploader
         _http.Timeout = TimeSpan.FromMinutes(30);
     }
 
-    public async Task<Guid> UploadAsync(
+    private async Task<Guid> UploadSmallAsync(
+        Stream source, string fileName, string contentType,
+        string deviceId, DateTimeOffset fileTime, long expectedSize,
+        IProgress<string>? progress, CancellationToken ct)
+    {
+        // 一次读入内存，不落临时文件
+        var buffer = new byte[expectedSize];
+        var totalRead = 0;
+        while (totalRead < expectedSize)
+        {
+            var n = await source.ReadAsync(buffer.AsMemory(totalRead, (int)expectedSize - totalRead), ct);
+            if (n == 0) break;
+            totalRead += n;
+        }
+        if (totalRead != expectedSize)
+            throw new InvalidOperationException($"size mismatch: expected {expectedSize}, got {totalRead}");
+
+        string fileHash;
+        List<string> hashes;
+
+        if (expectedSize <= ChunkSize)
+        {
+            // 单 chunk：fileHash == chunkHash[0]，只算一次
+            var h = Convert.ToHexString(SHA256.HashData(buffer)).ToLowerInvariant();
+            fileHash = h;
+            hashes = new List<string> { h };
+        }
+        else
+        {
+            fileHash = Convert.ToHexString(SHA256.HashData(buffer)).ToLowerInvariant();
+            hashes = new List<string>();
+            for (var offset = 0; offset < buffer.Length; offset += ChunkSize)
+            {
+                var len = Math.Min(ChunkSize, buffer.Length - offset);
+                hashes.Add(Convert.ToHexString(SHA256.HashData(buffer.AsSpan(offset, len))).ToLowerInvariant());
+            }
+        }
+
+        progress?.Report($"plan: {fileName} ({expectedSize} bytes, {hashes.Count} chunks, in-memory)");
+
+        var planReq = new PlanRequest(fileHash, fileName, expectedSize, ChunkSize, hashes, deviceId, contentType, fileTime);
+        var planResp = await PostJsonAsync<PlanResponse>("/api/upload/plan", planReq, ct);
+        if (planResp.AlreadyComplete) return planResp.FileId!.Value;
+
+        foreach (var idx in planResp.MissingChunks)
+        {
+            var offset = idx * ChunkSize;
+            var len = Math.Min(ChunkSize, buffer.Length - offset);
+            var seg = buffer.AsSpan(offset, len).ToArray();
+
+            var url = $"/api/upload/{planResp.UploadId}/chunk/{idx}?sha256={hashes[idx]}";
+            using var content = new ByteArrayContent(seg);
+            content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+            using var resp = await _http.PutAsync(url, content, ct);
+            resp.EnsureSuccessStatusCode();
+            progress?.Report($"  chunk {idx}/{hashes.Count - 1} uploaded");
+        }
+
+        var completeResp = await PostJsonAsync<CompleteResponse>(
+            $"/api/upload/{planResp.UploadId}/complete", null, ct);
+        return completeResp.FileId;
+    }
+
+    private async Task<Guid> UploadLargeAsync(
         Stream source, string fileName, string contentType,
         string deviceId, DateTimeOffset fileTime,
         IProgress<string>? progress, CancellationToken ct)
@@ -67,32 +132,50 @@ public class ChunkUploader
             if (planResp.AlreadyComplete) return planResp.FileId!.Value;
 
             // 4) 第二遍读：只上传缺失块
+            progress?.Report($"uploading {planResp.MissingChunks.Count} chunks (parallel={MaxConcurrentChunks})");
+            using var semaphore = new SemaphoreSlim(MaxConcurrentChunks);
+            var uploadTasks = new List<Task>(planResp.MissingChunks.Count);
+            var completedCount = 0;
+
             foreach (var idx in planResp.MissingChunks)
             {
-                var offset = (long)idx * ChunkSize;
-                var len = (int)Math.Min(ChunkSize, fileSize - offset);
-                var seg = new byte[len];
-
-                await using (var fs = new FileStream(tempPath, FileMode.Open,
-                                FileAccess.Read, FileShare.Read, 81920, useAsync: true))
+                await semaphore.WaitAsync(ct);
+                var capturedIdx = idx;
+                uploadTasks.Add(Task.Run(async () =>
                 {
-                    fs.Seek(offset, SeekOrigin.Begin);
-                    var totalRead = 0;
-                    while (totalRead < len)
+                    try
                     {
-                        var n = await fs.ReadAsync(seg.AsMemory(totalRead, len - totalRead), ct);
-                        if (n == 0) break;
-                        totalRead += n;
-                    }
-                }
+                        var offset = (long)capturedIdx * ChunkSize;
+                        var len = (int)Math.Min(ChunkSize, fileSize - offset);
+                        var seg = new byte[len];
+                        await using (var fs = new FileStream(tempPath, FileMode.Open,
+                                        FileAccess.Read, FileShare.Read, 81920, useAsync: true))
+                        {
+                            fs.Seek(offset, SeekOrigin.Begin);
+                            var total = 0;
+                            while (total < len)
+                            {
+                                var n = await fs.ReadAsync(seg.AsMemory(total, len - total), ct);
+                                if (n == 0) break;
+                                total += n;
+                            }
+                        }
+                        var url = $"/api/upload/{planResp.UploadId}/chunk/{capturedIdx}?sha256={hashes[capturedIdx]}";
+                        using var content = new ByteArrayContent(seg);
+                        content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                        using var resp = await _http.PutAsync(url, content, ct);
+                        resp.EnsureSuccessStatusCode();
 
-                var url = $"/api/upload/{planResp.UploadId}/chunk/{idx}?sha256={hashes[idx]}";
-                using var content = new ByteArrayContent(seg);
-                content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-                using var resp = await _http.PutAsync(url, content, ct);
-                resp.EnsureSuccessStatusCode();
-                progress?.Report($"  chunk {idx}/{hashes.Count - 1} uploaded");
+                        var done = Interlocked.Increment(ref completedCount);
+                        progress?.Report($"  chunk {done}/{planResp.MissingChunks.Count} uploaded");
+                    }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                }, ct));
             }
+            await Task.WhenAll(uploadTasks);
 
             // 5) complete
             var completeResp = await PostJsonAsync<CompleteResponse>(
@@ -116,5 +199,16 @@ public class ChunkUploader
         var json = await resp.Content.ReadAsStringAsync(ct);
         return JsonSerializer.Deserialize<T>(json,
             new JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
+    }
+
+    public async Task<Guid> UploadAsync(
+        Stream source, string fileName, string contentType,
+        string deviceId, DateTimeOffset fileTime, long expectedSize,
+        IProgress<string>? progress, CancellationToken ct)
+    {
+        if (expectedSize <= SmallFileThreshold)
+            return await UploadSmallAsync(source, fileName, contentType, deviceId, fileTime, expectedSize, progress, ct);
+        else
+            return await UploadLargeAsync(source, fileName, contentType, deviceId, fileTime, progress, ct);
     }
 }

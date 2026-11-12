@@ -42,7 +42,7 @@ public class BackupCoordinator
 
                 var fileTime = item.TakenAt ?? item.LastModified;
                 var fileId = await _uploader.UploadAsync(
-                    stream, item.DisplayName, item.ContentType, _deviceId, fileTime, progress, ct);
+                    stream, item.DisplayName, item.ContentType, _deviceId, fileTime, item.Size, progress, ct);
 
                 _state.Upsert(new LocalSyncRecord
                 {
