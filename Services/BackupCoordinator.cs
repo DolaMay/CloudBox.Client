@@ -6,19 +6,22 @@ public class BackupCoordinator
 {
     private readonly AndroidMediaScanner _scanner;
     private readonly SyncStateStore _state;
-    private readonly ChunkUploader _uploader;
+    private readonly FileUploader _uploader;
     private readonly string _deviceId;
 
     public BackupCoordinator(string baseUrl, string apiKey, string deviceId)
     {
         _scanner = new AndroidMediaScanner();
         _state = new SyncStateStore();
-        _uploader = new ChunkUploader(baseUrl, apiKey);
+        _uploader = new FileUploader(baseUrl, apiKey);
         _deviceId = deviceId;
     }
 
     public async Task<BackupResult> RunAsync(IProgress<string>? progress, CancellationToken ct)
     {
+        // 清理上次进程被杀时残留的上传临时文件
+        FileUploader.CleanStaleTempFiles(TimeSpan.FromHours(24));
+
         var items = _scanner.ScanPhotosAndVideos();
         int uploaded = 0, skipped = 0, failed = 0;
 
@@ -27,8 +30,6 @@ public class BackupCoordinator
             ct.ThrowIfCancellationRequested();
 
             var existing = _state.Get(item.ContentUri);
-
-            // 已同步且修改时间未变 → 跳过
             if (existing != null && existing.LastModified == item.LastModified)
             {
                 skipped++;
@@ -42,7 +43,8 @@ public class BackupCoordinator
 
                 var fileTime = item.TakenAt ?? item.LastModified;
                 var fileId = await _uploader.UploadAsync(
-                    stream, item.DisplayName, item.ContentType, _deviceId, fileTime, item.Size, progress, ct);
+                    stream, item.DisplayName, item.ContentType, _deviceId,
+                    fileTime, item.Size, progress, ct);
 
                 _state.Upsert(new LocalSyncRecord
                 {
