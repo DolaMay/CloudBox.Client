@@ -62,6 +62,7 @@ public class BackupForegroundService : Service
         _ = Task.Run(async () =>
         {
             var summary = "未知";
+            WifiPerformanceLock.Acquire();
             Log("background task started");
             try
             {
@@ -92,6 +93,7 @@ public class BackupForegroundService : Service
             }
             finally
             {
+                WifiPerformanceLock.Release();
                 try
                 {
                     Preferences.Default.Set("last_backup_result", summary);
@@ -113,6 +115,7 @@ public class BackupForegroundService : Service
     {
         // 关键诊断：如果这行日志出现在「自动取消」场景，说明系统杀掉了服务
         Log($"OnDestroy called, _isRunning={_isRunning}");
+        WifiPerformanceLock.Release();
         try { _cts?.Cancel(); } catch { }
         try { StopForeground(StopForegroundFlags.Remove); } catch { }
         try { _cts?.Dispose(); } catch { }

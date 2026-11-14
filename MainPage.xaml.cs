@@ -143,6 +143,22 @@ public partial class MainPage : ContentPage
             }
         }
 
+        if (PowerSaveModeHelper.IsPowerSaveMode())
+        {
+            var cont = await DisplayAlert(
+                "当前为省电模式",
+                "省电模式会限制 Wi-Fi 性能，备份过程中可能出现偶发卡顿或文件上传失败。\n\n" +
+                "CloudBox 会在备份期间自动持有 Wi-Fi 高性能锁缓解这个问题，" +
+                "但如果网络仍然不稳定，建议关闭省电模式后再备份。",
+                "继续备份", "去关闭省电");
+            if (!cont)
+            {
+                PowerSaveModeHelper.OpenPowerSaveSettings();
+                StatusLabel.Text = "请关闭省电模式后重新点击「开始扫描并备份」";
+                return;
+            }
+        }
+
         Preferences.Default.Remove("last_backup_result");
         Preferences.Default.Remove("last_backup_time");
         _cancelRequested = false;
