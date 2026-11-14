@@ -42,13 +42,14 @@ public static class AndroidDeviceInfoProvider
     /// <summary>生成用于服务端文件夹命名的设备标识，如 "HUAWEI_P70 Pro+_a1b2c3d4"</summary>
     public static string GetDeviceFolderName()
     {
-        var manufacturer = DeviceInfo.Manufacturer ?? "Unknown";
+        //var manufacturer = DeviceInfo.Manufacturer ?? "Unknown";
         var model = DeviceInfo.Model ?? "Device";
         var marketName = GetMarketName() ?? model;
 
         // 清理非法文件名字符
         var safe = string.Join("_",
-            $"{manufacturer}_{marketName}".Split(Path.GetInvalidFileNameChars()));
+            $"{marketName}".Split(Path.GetInvalidFileNameChars()));
+            //$"{manufacturer}_{marketName}".Split(Path.GetInvalidFileNameChars()));
         safe = safe.Replace(" ", "_").Trim('_');
 
         // AndroidId：设备+用户+App签名唯一，卸载重装不变（除非恢复出厂设置）
