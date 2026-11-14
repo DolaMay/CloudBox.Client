@@ -41,10 +41,10 @@ public class FileUploader
         catch { }
     }
 
-    /// <summary>拉取服务端已上传完成的所有 fileHash</summary>
-    public async Task<HashSet<string>> GetServerHashesAsync(
+    public async Task<ServerFileIndex> GetServerIndexAsync(
         IProgress<string>? progress, CancellationToken ct)
     {
+        var index = new ServerFileIndex();
         try
         {
             using var resp = await _http.GetAsync("/api/files/hashes", ct);
@@ -52,70 +52,96 @@ public class FileUploader
             var json = await resp.Content.ReadAsStringAsync(ct);
             var parsed = JsonSerializer.Deserialize<HashesResponse>(json,
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-            var set = new HashSet<string>(parsed?.Hashes ?? new List<string>(),
-                StringComparer.OrdinalIgnoreCase);
-            progress?.Report($"server hashes: {set.Count}");
-            return set;
+
+            if (parsed?.Items != null)
+            {
+                foreach (var e in parsed.Items)
+                    index.Add(e.FileName, e.Size, e.LastModified, e.FileHash);
+            }
+            progress?.Report($"服务端已有 {parsed?.Count ?? 0} 个文件");
         }
         catch (Exception ex)
         {
-            progress?.Report($"hashes fetch failed (continuing without): {ex.Message}");
-            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            progress?.Report($"获取服务端索引失败（继续尝试逐个上传）: {ex.Message}");
         }
+        return index;
     }
 
+    /// <summary>
+    /// 上传一个文件。openSource 是流工厂，可能需要调用 0~2 次：
+    /// - 元数据命中（fileName+size+lastModified）→ 调用 0 次（完全跳过）
+    /// - 元数据不命中但 hash 命中 → 调用 1 次（只读流算 hash）
+    /// - 都不命中 → 调用 2 次（算 hash + 复制到临时文件上传）
+    /// </summary>
     public async Task<UploadOutcome> UploadAsync(
-        Stream source, string fileName, string contentType,
-        string deviceId, DateTimeOffset fileTime, long expectedSize,
-        HashSet<string>? serverHashes,
+        Func<Stream> openSource,
+        string fileName, string contentType,
+        string deviceId, DateTimeOffset fileTime, DateTimeOffset lastModified,
+        long expectedSize,
+        ServerFileIndex? serverIndex,
         IProgress<string>? progress, CancellationToken ct)
     {
+        // ---- 阶段 0：元数据快速匹配，不打开文件、不算 hash ----
+        if (serverIndex != null &&
+            serverIndex.ContainsByMetadata(fileName, expectedSize, lastModified))
+        {
+            progress?.Report($"  已在服务端（元数据匹配）: {fileName}");
+            return new UploadOutcome(null, "", Skipped: true);
+        }
+
+        // ---- 阶段 1：只读流算 hash ----
+        string fileHash;
+        long totalBytes = 0;
+
+        using (var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
+        {
+            await using var source = openSource();
+            var buffer = new byte[81920];
+            int read;
+            while ((read = await source.ReadAsync(buffer.AsMemory(), ct)) > 0)
+            {
+                sha.AppendData(buffer, 0, read);
+                totalBytes += read;
+            }
+            fileHash = Convert.ToHexString(sha.GetHashAndReset()).ToLowerInvariant();
+        }
+
+        if (expectedSize > 0 && totalBytes != expectedSize)
+            throw new InvalidOperationException(
+                $"size mismatch: expected {expectedSize}, got {totalBytes}");
+
+        if (serverIndex != null && serverIndex.ContainsByHash(fileHash))
+        {
+            progress?.Report($"  已在服务端（hash 匹配）: {fileName}");
+            return new UploadOutcome(null, fileHash, Skipped: true);
+        }
+
+        // ---- 阶段 2：写入临时文件并上传 ----
         var uploadTempDir = Path.Combine(FileSystem.AppDataDirectory, TempDirName);
         Directory.CreateDirectory(uploadTempDir);
         var localPath = Path.Combine(uploadTempDir, $"{Guid.NewGuid():N}.upload");
 
         try
         {
-            string fileHash;
-            long totalBytes = 0;
-
-            using (var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
+            await using (var source = openSource())
             await using (var fs = new FileStream(localPath, FileMode.Create,
                              FileAccess.Write, FileShare.None, 81920, useAsync: true))
             {
-                var buffer = new byte[81920];
-                int read;
-                while ((read = await source.ReadAsync(buffer.AsMemory(), ct)) > 0)
-                {
-                    sha.AppendData(buffer, 0, read);
-                    await fs.WriteAsync(buffer.AsMemory(0, read), ct);
-                    totalBytes += read;
-                }
-                fileHash = Convert.ToHexString(sha.GetHashAndReset()).ToLowerInvariant();
-            }
-
-            if (expectedSize > 0 && totalBytes != expectedSize)
-                throw new InvalidOperationException(
-                    $"size mismatch: expected {expectedSize}, got {totalBytes}");
-
-            // 服务端已有 → 不调 plan，直接返回
-            if (serverHashes != null && serverHashes.Contains(fileHash))
-            {
-                //progress?.Report($"  skip (on server): {fileName}");
-                return new UploadOutcome(null, fileHash, Skipped: true);
+                await source.CopyToAsync(fs, 81920, ct);
             }
 
             progress?.Report($"plan: {fileName} ({totalBytes} bytes)");
 
             var planReq = new PlanRequest(
-                fileHash, fileName, totalBytes, deviceId, contentType, fileTime);
+                fileHash, fileName, totalBytes, deviceId, contentType,
+                fileTime, lastModified);
             var planResp = await PostJsonAsync<PlanResponse>("/api/upload/plan", planReq, ct);
 
             if (planResp.AlreadyComplete)
             {
                 if (!planResp.FileId.HasValue)
                     throw new InvalidOperationException("server returned alreadyComplete but no fileId");
-                progress?.Report($"  dedup: {fileName}");
+                progress?.Report($"  服务端已存在: {fileName}");
                 return new UploadOutcome(planResp.FileId.Value, fileHash, Skipped: true);
             }
 
@@ -131,7 +157,7 @@ public class FileUploader
                     $"/api/upload/{planResp.UploadId}/content", content, ct);
                 resp.EnsureSuccessStatusCode();
             }
-            progress?.Report($"  uploaded {totalBytes} bytes");
+            progress?.Report($"  已上传 {totalBytes} 字节: {fileName}");
 
             var completeResp = await PostJsonAsync<CompleteResponse>(
                 $"/api/upload/{planResp.UploadId}/complete", null, ct);
@@ -139,10 +165,7 @@ public class FileUploader
         }
         finally
         {
-            if (File.Exists(localPath))
-            {
-                try { File.Delete(localPath); } catch { }
-            }
+            try { if (File.Exists(localPath)) File.Delete(localPath); } catch { }
             try
             {
                 if (Directory.Exists(uploadTempDir) &&

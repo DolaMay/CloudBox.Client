@@ -1,18 +1,18 @@
 namespace CloudBox.Client.Models;
 
 public record PlanRequest(
-    string FileHash,
-    string FileName,
-    long Size,
-    string DeviceId,
-    string? ContentType,
-    DateTimeOffset FileTime);
+    string FileHash, string FileName, long Size,
+    string DeviceId, string? ContentType,
+    DateTimeOffset FileTime, DateTimeOffset LastModified);
 
 public record PlanResponse(Guid UploadId, bool AlreadyComplete, Guid? FileId);
 
 public record CompleteResponse(Guid FileId, bool Deduplicated);
 
-public record HashesResponse(int Count, List<string> Hashes);
+public record HashesResponse(int Count, List<HashesEntry> Items);
+
+public record HashesEntry(
+    string FileName, long Size, DateTimeOffset LastModified, string FileHash);
 
 public record UploadOutcome(Guid? FileId, string FileHash, bool Skipped);
 
@@ -24,4 +24,24 @@ public class LocalSyncRecord
     public DateTimeOffset LastModified { get; set; }
     public Guid? ServerFileId { get; set; }
     public DateTimeOffset? UploadedAt { get; set; }
+}
+
+/// <summary>服务端已有文件索引：hash 集合 + (fileName, size, lastModified) 三元组集合</summary>
+public class ServerFileIndex
+{
+    public HashSet<string> Hashes { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public HashSet<(string FileName, long Size, long LastModifiedUnix)> Keys { get; } = new();
+
+    public void Add(string fileName, long size, DateTimeOffset lastModified, string fileHash)
+    {
+        if (!string.IsNullOrEmpty(fileHash))
+            Hashes.Add(fileHash);
+        Keys.Add((fileName, size, lastModified.ToUnixTimeSeconds()));
+    }
+
+    public bool ContainsByMetadata(string fileName, long size, DateTimeOffset lastModified)
+        => Keys.Contains((fileName, size, lastModified.ToUnixTimeSeconds()));
+
+    public bool ContainsByHash(string fileHash) => Hashes.Contains(fileHash);
 }

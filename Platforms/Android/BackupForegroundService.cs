@@ -10,10 +10,13 @@ namespace CloudBox.Client.Platforms.Android;
          ForegroundServiceType = global::Android.Content.PM.ForegroundService.TypeDataSync)]
 public class BackupForegroundService : Service
 {
+    public const string ActionCancel = "cloudbox.cancel_backup";
+
     private const int NotificationId = 9001;
     private const string ChannelId = "cloudbox_backup";
+
+    private static volatile bool _isRunning;
     private static CancellationTokenSource? _cts;
-    private static bool _isRunning;
 
     public static bool IsRunning => _isRunning;
 
@@ -22,6 +25,14 @@ public class BackupForegroundService : Service
     public override StartCommandResult OnStartCommand(
         Intent? intent, StartCommandFlags flags, int startId)
     {
+        // 通知栏「取消」或 App 内取消：走这条分支，不 StopService，
+        // 让任务线程自己走 finally 清理（通知、状态、StopSelf）
+        if (intent?.Action == ActionCancel)
+        {
+            try { _cts?.Cancel(); } catch { }
+            return StartCommandResult.NotSticky;
+        }
+
         CreateNotificationChannel();
         StartForeground(NotificationId, BuildNotification("准备中..."));
 
@@ -33,6 +44,7 @@ public class BackupForegroundService : Service
         if (string.IsNullOrEmpty(baseUrl) || string.IsNullOrEmpty(apiKey))
         {
             UpdateNotification("未配置服务器，已停止");
+            StopForeground(StopForegroundFlags.Remove);
             StopSelf();
             return StartCommandResult.NotSticky;
         }
@@ -65,7 +77,6 @@ public class BackupForegroundService : Service
             }
             finally
             {
-                _isRunning = false;
                 try
                 {
                     Preferences.Default.Set("last_backup_result", summary);
@@ -74,7 +85,8 @@ public class BackupForegroundService : Service
                 }
                 catch { }
                 try { StopForeground(StopForegroundFlags.Remove); } catch { }
-                StopSelf();
+                try { StopSelf(); } catch { }
+                _isRunning = false;
             }
         }, token);
 
@@ -83,10 +95,13 @@ public class BackupForegroundService : Service
 
     public override void OnDestroy()
     {
+        // 兜底：如果 Service 被外部强行销毁（例如系统回收），
+        // 也要尝试移除通知，避免残留
         try { _cts?.Cancel(); } catch { }
+        try { StopForeground(StopForegroundFlags.Remove); } catch { }
         try { _cts?.Dispose(); } catch { }
         _cts = null;
-        _isRunning = false;
+        // _isRunning 不在这里设 false，交给任务线程 finally
         base.OnDestroy();
     }
 
@@ -97,10 +112,7 @@ public class BackupForegroundService : Service
         if (nm == null) return;
 
         var channel = new NotificationChannel(ChannelId, "CloudBox 备份",
-            NotificationImportance.Low)
-        {
-            Description = "备份进度通知"
-        };
+            NotificationImportance.Low) { Description = "备份进度通知" };
         nm.CreateNotificationChannel(channel);
     }
 
@@ -112,8 +124,13 @@ public class BackupForegroundService : Service
 
     private Notification BuildNotification(string text)
     {
-        var intent = new Intent(this, typeof(MainActivity));
-        var pending = PendingIntent.GetActivity(this, 0, intent,
+        var openIntent = new Intent(this, typeof(MainActivity));
+        var openPending = PendingIntent.GetActivity(this, 0, openIntent,
+            PendingIntentFlags.Immutable | PendingIntentFlags.UpdateCurrent);
+
+        var cancelIntent = new Intent(this, typeof(BackupForegroundService));
+        cancelIntent.SetAction(ActionCancel);
+        var cancelPending = PendingIntent.GetService(this, 1, cancelIntent,
             PendingIntentFlags.Immutable | PendingIntentFlags.UpdateCurrent);
 
         return new NotificationCompat.Builder(this, ChannelId)
@@ -121,7 +138,8 @@ public class BackupForegroundService : Service
             .SetContentText(text)
             .SetSmallIcon(global::Android.Resource.Drawable.IcDialogInfo)
             .SetOngoing(true)
-            .SetContentIntent(pending)
+            .SetContentIntent(openPending)
+            .AddAction(0, "取消", cancelPending)
             .Build();
     }
 }

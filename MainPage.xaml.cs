@@ -7,7 +7,11 @@ namespace CloudBox.Client;
 
 public partial class MainPage : ContentPage
 {
+#if ANDROID
     private IDispatcherTimer? _stateTimer;
+    private bool _cancelRequested;
+    private bool? _lastRunningState;   // ← 新增：上一次采样到的运行状态
+#endif
 
     public MainPage()
     {
@@ -32,34 +36,49 @@ public partial class MainPage : ContentPage
     protected override void OnDisappearing()
     {
         base.OnDisappearing();
+#if ANDROID
         _stateTimer?.Stop();
         _stateTimer = null;
+#endif
     }
 
     private void RefreshUiState()
     {
 #if ANDROID
         var running = BackupServiceStarter.IsRunning;
+
+        // 按钮状态每次都刷（无害，保证 UI 和 Service 状态一致）
         BackupButton.IsEnabled = !running;
         CancelButton.IsEnabled = running;
         DiscoverButton.IsEnabled = !running;
 
+        // StatusLabel 只在「运行状态变化」时更新，避免覆盖 mDNS 发现等临时消息
+        if (_lastRunningState == running)
+            return;
+
+        _lastRunningState = running;
+
         if (running)
         {
-            StatusLabel.Text = "备份进行中…（下拉通知栏查看进度，可息屏）";
+            StatusLabel.Text = _cancelRequested
+                ? "正在取消…"
+                : "备份进行中…（下拉通知栏查看进度，可息屏）";
             return;
         }
 
-        // 服务停止后显示上次结果
+        // 刚刚从 running → idle
+        _cancelRequested = false;
+
         var lastResult = Preferences.Default.Get("last_backup_result", "");
         var lastTimeStr = Preferences.Default.Get("last_backup_time", "");
         if (!string.IsNullOrEmpty(lastResult) && !string.IsNullOrEmpty(lastTimeStr) &&
             DateTimeOffset.TryParse(lastTimeStr, out var lastTime))
         {
             var local = lastTime.ToLocalTime().ToString("MM-dd HH:mm");
-            if (StatusLabel.Text?.StartsWith("备份进行中") != false)
-                StatusLabel.Text = $"上次备份 {local}: {lastResult}";
+            StatusLabel.Text = $"上次备份 {local}: {lastResult}";
         }
+        // 没有备份记录时保持现状：首次启动 StatusLabel 本来是空的，
+        // 用户如果在点「自动发现」，StatusLabel 里是发现结果，不要覆盖
 #endif
     }
 
@@ -83,7 +102,6 @@ public partial class MainPage : ContentPage
             return;
         }
 
-        // 1. 媒体权限
         var (imagesOk, videosOk) = await AndroidPermissionHelper.RequestMediaPermissionsAsync();
         if (!imagesOk)
         {
@@ -98,7 +116,6 @@ public partial class MainPage : ContentPage
             if (!cont) return;
         }
 
-        // 2. 通知权限（Android 13+）
         if (OperatingSystem.IsAndroidVersionAtLeast(33))
         {
             var notif = await Permissions.RequestAsync<Permissions.PostNotifications>();
@@ -111,7 +128,6 @@ public partial class MainPage : ContentPage
             }
         }
 
-        // 3. 电池优化（提示但不阻断）
         if (!BatteryOptimizationHelper.IsIgnoringBatteryOptimizations())
         {
             var goSettings = await DisplayAlert("建议关闭电池优化",
@@ -127,14 +143,15 @@ public partial class MainPage : ContentPage
             }
         }
 
-        // 4. 启动前台服务
         Preferences.Default.Remove("last_backup_result");
         Preferences.Default.Remove("last_backup_time");
+        _cancelRequested = false;
+
         StatusLabel.Text = "备份已启动，可息屏或切换应用";
         BackupServiceStarter.Start();
-        RefreshUiState();
+        // 不立即调 RefreshUiState：让 1 秒后的定时器采样到 running=true，
+        // 把 StatusLabel 平滑切换为「备份进行中」，不需要覆盖用户刚看到的「备份已启动」
 #else
-        // 非 Android 平台：直接同步调用（Windows 调试用）
         BackupButton.IsEnabled = false;
         CancelButton.IsEnabled = true;
         StatusLabel.Text = "备份进行中...";
@@ -159,8 +176,9 @@ public partial class MainPage : ContentPage
     private void OnCancelClicked(object sender, EventArgs e)
     {
 #if ANDROID
-        BackupServiceStarter.Stop();
-        StatusLabel.Text = "已请求取消，正在停止…";
+        _cancelRequested = true;
+        BackupServiceStarter.Cancel();
+        StatusLabel.Text = "正在取消…";
         CancelButton.IsEnabled = false;
 #endif
     }
@@ -191,7 +209,8 @@ public partial class MainPage : ContentPage
         }
         finally
         {
-            DiscoverButton.IsEnabled = !BackupServiceStarter.IsRunning;
+            // 按钮状态同步：只刷按钮，不覆盖 StatusLabel
+            RefreshUiState();
         }
 #endif
     }

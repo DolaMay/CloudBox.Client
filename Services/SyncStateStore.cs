@@ -1,17 +1,27 @@
-using System.Text.Json;
+using SQLite;
 using CloudBox.Client.Models;
 
 namespace CloudBox.Client.Services;
 
 public class SyncStateStore
 {
-    private readonly string _path;
-    private Dictionary<string, LocalSyncRecord> _cache;
+    private const int FlushThreshold = 20;
+
+    private readonly SQLiteConnection _db;
+    private readonly Dictionary<string, LocalSyncRecord> _cache;
+    private readonly List<LocalSyncRecord> _pending = new();
 
     public SyncStateStore()
     {
-        _path = Path.Combine(FileSystem.AppDataDirectory, "sync-state.json");
-        _cache = Load();
+        var dbPath = Path.Combine(FileSystem.AppDataDirectory, "sync-state.db3");
+        _db = new SQLiteConnection(dbPath);
+
+        // WAL + NORMAL：减少每次写入的 fsync 开销
+        _db.ExecuteScalar<string>("PRAGMA journal_mode=WAL");
+        _db.ExecuteScalar<string>("PRAGMA synchronous=NORMAL");
+
+        _db.CreateTable<SyncRecordEntity>();
+        _cache = LoadCache();
     }
 
     public LocalSyncRecord? Get(string localPath) =>
@@ -20,21 +30,73 @@ public class SyncStateStore
     public void Upsert(LocalSyncRecord record)
     {
         _cache[record.LocalPath] = record;
-        Save();
+        _pending.Add(record);
+
+        if (_pending.Count >= FlushThreshold)
+            Flush();
     }
 
-    private Dictionary<string, LocalSyncRecord> Load()
+    /// <summary>把缓冲区里的记录一次性提交。BackupCoordinator 在循环结束时必须调用一次。</summary>
+    public void Flush()
     {
-        if (!File.Exists(_path)) return new();
+        if (_pending.Count == 0) return;
+
         try
         {
-            return JsonSerializer.Deserialize<Dictionary<string, LocalSyncRecord>>(
-                File.ReadAllText(_path)) ?? new();
+            // RunInTransaction 内部自动处理 commit/rollback
+            _db.RunInTransaction(() =>
+            {
+                foreach (var record in _pending)
+                {
+                    _db.InsertOrReplace(new SyncRecordEntity
+                    {
+                        LocalPath = record.LocalPath,
+                        FileHash = record.FileHash,
+                        Size = record.Size,
+                        LastModifiedIso = record.LastModified.ToString("o"),
+                        ServerFileId = record.ServerFileId?.ToString(),
+                        UploadedAtIso = record.UploadedAt?.ToString("o")
+                    });
+                }
+            });
         }
-        catch { return new(); }
+        catch
+        {
+            // 批量写失败不阻断主流程，下次扫描会重新处理这些文件
+        }
+        finally
+        {
+            _pending.Clear();
+        }
     }
 
-    private void Save() =>
-        File.WriteAllText(_path, JsonSerializer.Serialize(_cache,
-            new JsonSerializerOptions { WriteIndented = true }));
+    private Dictionary<string, LocalSyncRecord> LoadCache()
+    {
+        var result = new Dictionary<string, LocalSyncRecord>();
+        foreach (var e in _db.Table<SyncRecordEntity>())
+        {
+            result[e.LocalPath] = new LocalSyncRecord
+            {
+                LocalPath = e.LocalPath,
+                FileHash = e.FileHash,
+                Size = e.Size,
+                LastModified = DateTimeOffset.Parse(e.LastModifiedIso),
+                ServerFileId = string.IsNullOrEmpty(e.ServerFileId) ? null : Guid.Parse(e.ServerFileId),
+                UploadedAt = string.IsNullOrEmpty(e.UploadedAtIso) ? null : DateTimeOffset.Parse(e.UploadedAtIso)
+            };
+        }
+        return result;
+    }
+}
+
+[Table("sync_state")]
+public class SyncRecordEntity
+{
+    [PrimaryKey]
+    public string LocalPath { get; set; } = "";
+    public string FileHash { get; set; } = "";
+    public long Size { get; set; }
+    public string LastModifiedIso { get; set; } = "";
+    public string? ServerFileId { get; set; }
+    public string? UploadedAtIso { get; set; }
 }
