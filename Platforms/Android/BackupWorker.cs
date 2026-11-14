@@ -19,7 +19,7 @@ public class BackupWorker : Worker
                 return Result.InvokeFailure();
 
             var coordinator = new BackupCoordinator(
-                baseUrl, apiKey, DeviceInfo.Name ?? "android");
+                baseUrl, apiKey, AndroidDeviceInfoProvider.GetDeviceFolderName());
 
             // Worker 在后台线程，同步等待即可
             var result = coordinator.RunAsync(null, CancellationToken.None)

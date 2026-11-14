@@ -6,6 +6,8 @@
         <VerticalStackLayout Padding="24" Spacing="16">
             <Label Text="CloudBox 备份" FontSize="24" FontAttributes="Bold" />
 
+            <Button x:Name="DiscoverButton" Text="搜索CloudBox服务器" Clicked="OnDiscoverClicked" />
+
             <Entry x:Name="ServerUrlEntry" Placeholder="http://192.168.1.10:5080" />
             <Entry x:Name="ApiKeyEntry" Placeholder="dev-key-change-me" IsPassword="True" />
 

@@ -49,7 +49,8 @@ public partial class MainPage : ContentPage
 
         try
         {
-            var coordinator = new BackupCoordinator(baseUrl, apiKey, DeviceInfo.Name ?? "android");
+            var deviceFolder = AndroidDeviceInfoProvider.GetDeviceFolderName();
+            var coordinator = new BackupCoordinator(baseUrl, apiKey, deviceFolder);
             var result = await coordinator.RunAsync(progress, _cts.Token);
             StatusLabel.Text =
                 $"完成：共 {result.Total}，上传 {result.Uploaded}，跳过 {result.Skipped}，失败 {result.Failed}";
@@ -72,6 +73,7 @@ public partial class MainPage : ContentPage
         if (!e.Value)
         {
             WorkScheduler.Cancel();
+            _cts?.Cancel();
             StatusLabel.Text = "已关闭后台备份";
             return;
         }
@@ -93,6 +95,37 @@ public partial class MainPage : ContentPage
         WorkScheduler.Schedule(TimeSpan.FromMinutes(15));
         StatusLabel.Text = "已启用后台备份（每 6 小时尝试一次）。" +
                         "若长时间未触发，请回到系统设置确认本 App 的电池优化已设为「不限制」。";
+    #endif
+    }
+    private async void OnDiscoverClicked(object sender, EventArgs e)
+    {
+    #if ANDROID
+        DiscoverButton.IsEnabled = false;
+        StatusLabel.Text = "正在扫描局域网内的 CloudBox 服务...";
+
+        try
+        {
+            var servers = await MdnsDiscovery.DiscoverAsync(
+                TimeSpan.FromSeconds(5), CancellationToken.None);
+
+            if (servers.Count == 0)
+            {
+                StatusLabel.Text = "未发现服务器。请确认手机和 PC 在同一 Wi-Fi，且 PC 端已启动。";
+                return;
+            }
+
+            var first = servers[0];
+            ServerUrlEntry.Text = $"http://{first.Host}:{first.Port}";
+            StatusLabel.Text = $"已发现: {first.Name} ({first.Host}:{first.Port})。请确认 API Key 后开始备份。";
+        }
+        catch (Exception ex)
+        {
+            StatusLabel.Text = $"发现失败: {ex.Message}";
+        }
+        finally
+        {
+            DiscoverButton.IsEnabled = true;
+        }
     #endif
     }
     private void OnCancelClicked(object sender, EventArgs e) => _cts?.Cancel();
