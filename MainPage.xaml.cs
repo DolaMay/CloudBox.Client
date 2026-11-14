@@ -1,20 +1,66 @@
-﻿#if ANDROID
+﻿using CloudBox.Client.Services;
+#if ANDROID
 using CloudBox.Client.Platforms.Android;
 #endif
-using System.Collections.ObjectModel;
-using CloudBox.Client.Services;
 
 namespace CloudBox.Client;
 
 public partial class MainPage : ContentPage
 {
-    private CancellationTokenSource? _cts;
+    private IDispatcherTimer? _stateTimer;
 
     public MainPage()
     {
         InitializeComponent();
         ServerUrlEntry.Text = AppSettingsStore.ServerUrl;
         ApiKeyEntry.Text = AppSettingsStore.ApiKey;
+    }
+
+    protected override void OnAppearing()
+    {
+        base.OnAppearing();
+#if ANDROID
+        RefreshUiState();
+        _stateTimer?.Stop();
+        _stateTimer = Dispatcher.CreateTimer();
+        _stateTimer.Interval = TimeSpan.FromSeconds(1);
+        _stateTimer.Tick += (s, e) => RefreshUiState();
+        _stateTimer.Start();
+#endif
+    }
+
+    protected override void OnDisappearing()
+    {
+        base.OnDisappearing();
+        _stateTimer?.Stop();
+        _stateTimer = null;
+    }
+
+    private void RefreshUiState()
+    {
+#if ANDROID
+        var running = BackupServiceStarter.IsRunning;
+        BackupButton.IsEnabled = !running;
+        CancelButton.IsEnabled = running;
+        DiscoverButton.IsEnabled = !running;
+
+        if (running)
+        {
+            StatusLabel.Text = "备份进行中…（下拉通知栏查看进度，可息屏）";
+            return;
+        }
+
+        // 服务停止后显示上次结果
+        var lastResult = Preferences.Default.Get("last_backup_result", "");
+        var lastTimeStr = Preferences.Default.Get("last_backup_time", "");
+        if (!string.IsNullOrEmpty(lastResult) && !string.IsNullOrEmpty(lastTimeStr) &&
+            DateTimeOffset.TryParse(lastTimeStr, out var lastTime))
+        {
+            var local = lastTime.ToLocalTime().ToString("MM-dd HH:mm");
+            if (StatusLabel.Text?.StartsWith("备份进行中") != false)
+                StatusLabel.Text = $"上次备份 {local}: {lastResult}";
+        }
+#endif
     }
 
     private async void OnBackupClicked(object sender, EventArgs e)
@@ -28,81 +74,102 @@ public partial class MainPage : ContentPage
         }
 
         AppSettingsStore.ServerUrl = baseUrl;
-        AppSettingsStore.ApiKey    = apiKey;
+        AppSettingsStore.ApiKey = apiKey;
 
-        if (!await RequestMediaPermissionAsync())
+#if ANDROID
+        if (BackupServiceStarter.IsRunning)
         {
-            StatusLabel.Text = "未获得相册读取权限";
+            StatusLabel.Text = "备份已经在运行中";
             return;
         }
 
-        _cts = new CancellationTokenSource();
+        // 1. 媒体权限
+        var (imagesOk, videosOk) = await AndroidPermissionHelper.RequestMediaPermissionsAsync();
+        if (!imagesOk)
+        {
+            StatusLabel.Text = "未获得照片读取权限，无法备份";
+            return;
+        }
+        if (!videosOk)
+        {
+            var cont = await DisplayAlert("提示",
+                "视频权限被拒绝，本次只备份照片。需要备份视频请去系统设置手动开启。",
+                "继续", "取消");
+            if (!cont) return;
+        }
+
+        // 2. 通知权限（Android 13+）
+        if (OperatingSystem.IsAndroidVersionAtLeast(33))
+        {
+            var notif = await Permissions.RequestAsync<Permissions.PostNotifications>();
+            if (notif != PermissionStatus.Granted)
+            {
+                var cont = await DisplayAlert("提示",
+                    "通知权限被拒绝，前台服务会继续运行，但通知栏看不到进度。",
+                    "继续", "取消");
+                if (!cont) return;
+            }
+        }
+
+        // 3. 电池优化（提示但不阻断）
+        if (!BatteryOptimizationHelper.IsIgnoringBatteryOptimizations())
+        {
+            var goSettings = await DisplayAlert("建议关闭电池优化",
+                "长时间备份时，系统电池优化可能暂停前台服务。\n" +
+                "建议把 CloudBox 的电池优化设为「不限制」。\n\n" +
+                "可以先去设置，返回后再点「开始扫描并备份」。",
+                "去设置", "直接开始");
+            if (goSettings)
+            {
+                BatteryOptimizationHelper.OpenBatteryOptimizationSettings();
+                StatusLabel.Text = "请返回本页后再次点击「开始扫描并备份」";
+                return;
+            }
+        }
+
+        // 4. 启动前台服务
+        Preferences.Default.Remove("last_backup_result");
+        Preferences.Default.Remove("last_backup_time");
+        StatusLabel.Text = "备份已启动，可息屏或切换应用";
+        BackupServiceStarter.Start();
+        RefreshUiState();
+#else
+        // 非 Android 平台：直接同步调用（Windows 调试用）
         BackupButton.IsEnabled = false;
         CancelButton.IsEnabled = true;
-
-        var lines = new ObservableCollection<string>();
-        var progress = new Progress<string>(msg =>
-        {
-            lines.Add(msg);
-            StatusLabel.Text = string.Join("\n", lines.TakeLast(8));
-        });
-
+        StatusLabel.Text = "备份进行中...";
         try
         {
-            var deviceFolder = AndroidDeviceInfoProvider.GetDeviceFolderName();
-            var coordinator = new BackupCoordinator(baseUrl, apiKey, deviceFolder);
-            var result = await coordinator.RunAsync(progress, _cts.Token);
+            var deviceName = DeviceInfo.Name ?? "device";
+            var coordinator = new BackupCoordinator(baseUrl, apiKey, deviceName);
+            var progress = new Progress<string>(msg =>
+                MainThread.BeginInvokeOnMainThread(() => StatusLabel.Text = msg));
+            var result = await coordinator.RunAsync(progress, CancellationToken.None);
             StatusLabel.Text =
-                $"完成：共 {result.Total}，上传 {result.Uploaded}，跳过 {result.Skipped}，失败 {result.Failed}";
-        }
-        catch (OperationCanceledException)
-        {
-            StatusLabel.Text = "已取消";
+                $"完成：上传 {result.Uploaded}，跳过 {result.Skipped}，失败 {result.Failed}";
         }
         finally
         {
             BackupButton.IsEnabled = true;
             CancelButton.IsEnabled = false;
-            _cts.Dispose();
-            _cts = null;
         }
+#endif
     }
-    private async void OnBackgroundToggled(object sender, ToggledEventArgs e)
+
+    private void OnCancelClicked(object sender, EventArgs e)
     {
-    #if ANDROID
-        if (!e.Value)
-        {
-            WorkScheduler.Cancel();
-            _cts?.Cancel();
-            StatusLabel.Text = "已关闭后台备份";
-            return;
-        }
-
-        // 开启前先检查电池优化状态
-        if (!BatteryOptimizationHelper.IsIgnoringBatteryOptimizations())
-        {
-            var go = await DisplayAlert(
-                "需要关闭电池优化",
-                "Android 的电池优化可能会在后台杀死定时备份任务。\n\n" +
-                "请在打开的设置页中找到「CloudBox」，把电池优化设为「无限制」或「不优化」。\n\n" +
-                "设置完成后返回本页，后台备份会自动生效。",
-                "去设置", "稍后再说");
-
-            if (go)
-                BatteryOptimizationHelper.OpenBatteryOptimizationSettings();
-        }
-
-        WorkScheduler.Schedule(TimeSpan.FromMinutes(15));
-        StatusLabel.Text = "已启用后台备份（每 6 小时尝试一次）。" +
-                        "若长时间未触发，请回到系统设置确认本 App 的电池优化已设为「不限制」。";
-    #endif
+#if ANDROID
+        BackupServiceStarter.Stop();
+        StatusLabel.Text = "已请求取消，正在停止…";
+        CancelButton.IsEnabled = false;
+#endif
     }
+
     private async void OnDiscoverClicked(object sender, EventArgs e)
     {
-    #if ANDROID
+#if ANDROID
         DiscoverButton.IsEnabled = false;
         StatusLabel.Text = "正在扫描局域网内的 CloudBox 服务...";
-
         try
         {
             var servers = await MdnsDiscovery.DiscoverAsync(
@@ -116,7 +183,7 @@ public partial class MainPage : ContentPage
 
             var first = servers[0];
             ServerUrlEntry.Text = $"http://{first.Host}:{first.Port}";
-            StatusLabel.Text = $"已发现: {first.Name} ({first.Host}:{first.Port})。请确认 API Key 后开始备份。";
+            StatusLabel.Text = $"已发现: {first.Name} ({first.Host}:{first.Port})。";
         }
         catch (Exception ex)
         {
@@ -124,18 +191,8 @@ public partial class MainPage : ContentPage
         }
         finally
         {
-            DiscoverButton.IsEnabled = true;
+            DiscoverButton.IsEnabled = !BackupServiceStarter.IsRunning;
         }
-    #endif
+#endif
     }
-    private void OnCancelClicked(object sender, EventArgs e) => _cts?.Cancel();
-
-	private async Task<bool> RequestMediaPermissionAsync()
-	{
-	#if ANDROID
-		return await AndroidPermissionHelper.RequestMediaPermissionsAsync();
-	#else
-		return true;
-	#endif
-	}
 }

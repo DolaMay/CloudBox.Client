@@ -12,6 +12,10 @@ public record PlanResponse(Guid UploadId, bool AlreadyComplete, Guid? FileId);
 
 public record CompleteResponse(Guid FileId, bool Deduplicated);
 
+public record HashesResponse(int Count, List<string> Hashes);
+
+public record UploadOutcome(Guid? FileId, string FileHash, bool Skipped);
+
 public class LocalSyncRecord
 {
     public string LocalPath { get; set; } = "";

@@ -6,20 +6,13 @@
         <VerticalStackLayout Padding="24" Spacing="16">
             <Label Text="CloudBox 备份" FontSize="24" FontAttributes="Bold" />
 
-            <Button x:Name="DiscoverButton" Text="搜索CloudBox服务器" Clicked="OnDiscoverClicked" />
-
             <Entry x:Name="ServerUrlEntry" Placeholder="http://192.168.1.10:5080" />
             <Entry x:Name="ApiKeyEntry" Placeholder="dev-key-change-me" IsPassword="True" />
 
-            <HorizontalStackLayout Spacing="12">
-                <Label Text="后台定时备份" VerticalOptions="Center" />
-                <Switch x:Name="BackgroundSwitch" Toggled="OnBackgroundToggled" />
-            </HorizontalStackLayout>
-
+            <Button x:Name="DiscoverButton" Text="搜索CloudBox服务器" Clicked="OnDiscoverClicked" />
             <Button x:Name="BackupButton" Text="开始扫描并备份" Clicked="OnBackupClicked" />
-            <Button x:Name="CancelButton" Text="取消" Clicked="OnCancelClicked" IsEnabled="False" />
+            <Button x:Name="CancelButton" Text="取消备份" Clicked="OnCancelClicked" IsEnabled="False" />
 
-            <ProgressBar x:Name="ProgressBar" />
             <Label x:Name="StatusLabel" LineBreakMode="WordWrap" />
         </VerticalStackLayout>
     </ScrollView>

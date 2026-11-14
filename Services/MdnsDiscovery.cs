@@ -92,7 +92,7 @@ public class MdnsDiscovery
 
             await Task.Delay(timeout, ct).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) { }
+        catch (System.OperationCanceledException) { }
         catch (Exception ex)
         {
             Log($"mdns error: {ex.GetType().Name}: {ex.Message}");

@@ -4,6 +4,9 @@ namespace CloudBox.Client.Services;
 
 public class BackupCoordinator
 {
+    // 进程内全局锁：手动备份和任何其它入口都串行化
+    private static readonly SemaphoreSlim _globalLock = new(1, 1);
+
     private readonly AndroidMediaScanner _scanner;
     private readonly SyncStateStore _state;
     private readonly FileUploader _uploader;
@@ -19,56 +22,75 @@ public class BackupCoordinator
 
     public Task<BackupResult> RunAsync(IProgress<string>? progress, CancellationToken ct)
     {
-        // 整个扫描 + 上传循环都放到线程池，UI 线程彻底空闲，进度回调才能实时刷
         return Task.Run(async () =>
         {
-            FileUploader.CleanStaleTempFiles(TimeSpan.FromHours(24));
-
-            var items = _scanner.ScanPhotosAndVideos();
-            progress?.Report($"scanned {items.Count} items");
-
-            int uploaded = 0, skipped = 0, failed = 0;
-
-            foreach (var item in items)
+            if (!await _globalLock.WaitAsync(TimeSpan.Zero, ct))
             {
-                ct.ThrowIfCancellationRequested();
-
-                var existing = _state.Get(item.ContentUri);
-                if (existing != null && existing.LastModified == item.LastModified)
-                {
-                    skipped++;
-                    continue;
-                }
-
-                try
-                {
-                    await using var stream = Android.App.Application.Context
-                        .ContentResolver!.OpenInputStream(Android.Net.Uri.Parse(item.ContentUri))!;
-
-                    var fileTime = item.TakenAt ?? item.LastModified;
-                    var fileId = await _uploader.UploadAsync(
-                        stream, item.DisplayName, item.ContentType, _deviceId,
-                        fileTime, item.Size, progress, ct);
-
-                    _state.Upsert(new LocalSyncRecord
-                    {
-                        LocalPath = item.ContentUri,
-                        Size = item.Size,
-                        LastModified = item.LastModified,
-                        ServerFileId = fileId,
-                        UploadedAt = DateTimeOffset.UtcNow
-                    });
-                    uploaded++;
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    failed++;
-                    progress?.Report($"FAILED {item.DisplayName}: {ex.Message}");
-                }
+                progress?.Report("已有备份任务在运行，本次跳过");
+                return new BackupResult(0, 0, 0, 0);
             }
 
-            return new BackupResult(items.Count, uploaded, skipped, failed);
+            try { return await RunInternalAsync(progress, ct); }
+            finally { _globalLock.Release(); }
         }, ct);
+    }
+
+    private async Task<BackupResult> RunInternalAsync(
+        IProgress<string>? progress, CancellationToken ct)
+    {
+        FileUploader.CleanStaleTempFiles(TimeSpan.FromHours(24));
+
+        var items = _scanner.ScanPhotosAndVideos();
+        var photoCount = items.Count(i => i.ContentType?.StartsWith("image/") == true);
+        var videoCount = items.Count(i => i.ContentType?.StartsWith("video/") == true);
+        progress?.Report($"扫描到 {items.Count} 项（{photoCount} 照片, {videoCount} 视频）");
+
+        var serverHashes = await _uploader.GetServerHashesAsync(progress, ct);
+
+        int uploaded = 0, skipped = 0, failed = 0;
+
+        foreach (var item in items)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var existing = _state.Get(item.ContentUri);
+            if (existing != null && existing.LastModified == item.LastModified)
+            {
+                skipped++;
+                continue;
+            }
+
+            try
+            {
+                await using var stream = Android.App.Application.Context
+                    .ContentResolver!.OpenInputStream(Android.Net.Uri.Parse(item.ContentUri))!;
+
+                var fileTime = item.TakenAt ?? item.LastModified;
+                var outcome = await _uploader.UploadAsync(
+                    stream, item.DisplayName, item.ContentType, _deviceId,
+                    fileTime, item.Size, serverHashes, progress, ct);
+
+                _state.Upsert(new LocalSyncRecord
+                {
+                    LocalPath = item.ContentUri,
+                    FileHash = outcome.FileHash,
+                    Size = item.Size,
+                    LastModified = item.LastModified,
+                    ServerFileId = outcome.FileId,
+                    UploadedAt = DateTimeOffset.UtcNow
+                });
+
+                if (outcome.Skipped) skipped++;
+                else uploaded++;
+            }
+            catch (Exception ex) when (ex is not System.OperationCanceledException)
+            {
+                failed++;
+                progress?.Report($"失败 {item.DisplayName}: {ex.Message}");
+            }
+        }
+
+        return new BackupResult(items.Count, uploaded, skipped, failed);
     }
 }
 
