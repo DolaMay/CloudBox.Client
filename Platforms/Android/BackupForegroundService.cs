@@ -25,10 +25,11 @@ public class BackupForegroundService : Service
     public override StartCommandResult OnStartCommand(
         Intent? intent, StartCommandFlags flags, int startId)
     {
-        // 通知栏「取消」或 App 内取消：走这条分支，不 StopService，
-        // 让任务线程自己走 finally 清理（通知、状态、StopSelf）
+        Log($"OnStartCommand action={intent?.Action}, _isRunning={_isRunning}");
+
         if (intent?.Action == ActionCancel)
         {
+            Log("cancel requested via Intent");
             try { _cts?.Cancel(); } catch { }
             return StartCommandResult.NotSticky;
         }
@@ -37,7 +38,10 @@ public class BackupForegroundService : Service
         StartForeground(NotificationId, BuildNotification("准备中..."));
 
         if (_isRunning)
+        {
+            Log("already running, ignore start");
             return StartCommandResult.NotSticky;
+        }
 
         var baseUrl = AppSettingsStore.ServerUrl;
         var apiKey = AppSettingsStore.ApiKey;
@@ -58,21 +62,32 @@ public class BackupForegroundService : Service
         _ = Task.Run(async () =>
         {
             var summary = "未知";
+            Log("background task started");
             try
             {
                 var progress = new Progress<string>(msg => UpdateNotification(msg));
                 var result = await coordinator.RunAsync(progress, token);
                 summary = $"{result.Uploaded} 上传, {result.Skipped} 跳过, {result.Failed} 失败";
+                Log($"backup completed: {summary}");
                 UpdateNotification($"完成: {summary}");
+            }
+            catch (System.OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                summary = "已取消";
+                Log("backup cancelled by user");
+                UpdateNotification(summary);
             }
             catch (System.OperationCanceledException)
             {
-                summary = "已取消";
+                // 内部 OCE 泄漏 —— 极罕见，不视为用户取消
+                summary = "内部错误（已停止）";
+                Log("WARNING: leaked OperationCanceledException without user cancel");
                 UpdateNotification(summary);
             }
             catch (Exception ex)
             {
                 summary = $"失败: {ex.Message}";
+                Log($"backup failed: {ex}");
                 UpdateNotification(summary);
             }
             finally
@@ -87,6 +102,7 @@ public class BackupForegroundService : Service
                 try { StopForeground(StopForegroundFlags.Remove); } catch { }
                 try { StopSelf(); } catch { }
                 _isRunning = false;
+                Log($"background task ended: summary={summary}");
             }
         }, token);
 
@@ -95,13 +111,12 @@ public class BackupForegroundService : Service
 
     public override void OnDestroy()
     {
-        // 兜底：如果 Service 被外部强行销毁（例如系统回收），
-        // 也要尝试移除通知，避免残留
+        // 关键诊断：如果这行日志出现在「自动取消」场景，说明系统杀掉了服务
+        Log($"OnDestroy called, _isRunning={_isRunning}");
         try { _cts?.Cancel(); } catch { }
         try { StopForeground(StopForegroundFlags.Remove); } catch { }
         try { _cts?.Dispose(); } catch { }
         _cts = null;
-        // _isRunning 不在这里设 false，交给任务线程 finally
         base.OnDestroy();
     }
 
@@ -118,8 +133,12 @@ public class BackupForegroundService : Service
 
     private void UpdateNotification(string text)
     {
-        var nm = (NotificationManager?)GetSystemService(NotificationService);
-        nm?.Notify(NotificationId, BuildNotification(text));
+        try
+        {
+            var nm = (NotificationManager?)GetSystemService(NotificationService);
+            nm?.Notify(NotificationId, BuildNotification(text));
+        }
+        catch { }
     }
 
     private Notification BuildNotification(string text)
@@ -141,5 +160,14 @@ public class BackupForegroundService : Service
             .SetContentIntent(openPending)
             .AddAction(0, "取消", cancelPending)
             .Build();
+    }
+
+    private static void Log(string msg)
+    {
+#if ANDROID
+        global::Android.Util.Log.Debug("CloudBox", msg);
+#else
+        System.Diagnostics.Debug.WriteLine($"[CloudBox] {msg}");
+#endif
     }
 }

@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
@@ -11,11 +12,26 @@ public class FileUploader
     private readonly HttpClient _http;
     private const string TempDirName = ".upload_tmp";
 
+    private static readonly TimeSpan ShortRequestTimeout = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan ContentUploadTimeout = TimeSpan.FromMinutes(20);
+
     public FileUploader(string baseUrl, string apiKey)
     {
-        _http = new HttpClient { BaseAddress = new Uri(baseUrl) };
+        var handler = new SocketsHttpHandler
+        {
+            PooledConnectionLifetime = TimeSpan.FromSeconds(15),
+            PooledConnectionIdleTimeout = TimeSpan.FromSeconds(10),
+            ConnectTimeout = TimeSpan.FromSeconds(10),
+            AutomaticDecompression = DecompressionMethods.All,
+            EnableMultipleHttp2Connections = false,
+        };
+
+        _http = new HttpClient(handler)
+        {
+            BaseAddress = new Uri(baseUrl),
+            Timeout = TimeSpan.FromMinutes(25),
+        };
         _http.DefaultRequestHeaders.Add("X-Api-Key", apiKey);
-        _http.Timeout = TimeSpan.FromMinutes(60);
     }
 
     public static void CleanStaleTempFiles(TimeSpan maxAge)
@@ -45,11 +61,14 @@ public class FileUploader
         IProgress<string>? progress, CancellationToken ct)
     {
         var index = new ServerFileIndex();
+        using var reqCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        reqCts.CancelAfter(ShortRequestTimeout);
+
         try
         {
-            using var resp = await _http.GetAsync("/api/files/hashes", ct);
+            using var resp = await _http.GetAsync("/api/files/hashes", reqCts.Token);
             resp.EnsureSuccessStatusCode();
-            var json = await resp.Content.ReadAsStringAsync(ct);
+            var json = await resp.Content.ReadAsStringAsync(reqCts.Token);
             var parsed = JsonSerializer.Deserialize<HashesResponse>(json,
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
 
@@ -67,12 +86,6 @@ public class FileUploader
         return index;
     }
 
-    /// <summary>
-    /// 上传一个文件。openSource 是流工厂，可能需要调用 0~2 次：
-    /// - 元数据命中（fileName+size+lastModified）→ 调用 0 次（完全跳过）
-    /// - 元数据不命中但 hash 命中 → 调用 1 次（只读流算 hash）
-    /// - 都不命中 → 调用 2 次（算 hash + 复制到临时文件上传）
-    /// </summary>
     public async Task<UploadOutcome> UploadAsync(
         Func<Stream> openSource,
         string fileName, string contentType,
@@ -81,7 +94,6 @@ public class FileUploader
         ServerFileIndex? serverIndex,
         IProgress<string>? progress, CancellationToken ct)
     {
-        // ---- 阶段 0：元数据快速匹配，不打开文件、不算 hash ----
         if (serverIndex != null &&
             serverIndex.ContainsByMetadata(fileName, expectedSize, lastModified))
         {
@@ -89,10 +101,9 @@ public class FileUploader
             return new UploadOutcome(null, "", Skipped: true);
         }
 
-        // ---- 阶段 1：只读流算 hash ----
+        // 阶段 1：算 hash
         string fileHash;
         long totalBytes = 0;
-
         using (var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
         {
             await using var source = openSource();
@@ -116,7 +127,7 @@ public class FileUploader
             return new UploadOutcome(null, fileHash, Skipped: true);
         }
 
-        // ---- 阶段 2：写入临时文件并上传 ----
+        // 阶段 2：写临时文件 + 上传
         var uploadTempDir = Path.Combine(FileSystem.AppDataDirectory, TempDirName);
         Directory.CreateDirectory(uploadTempDir);
         var localPath = Path.Combine(uploadTempDir, $"{Guid.NewGuid():N}.upload");
@@ -135,7 +146,22 @@ public class FileUploader
             var planReq = new PlanRequest(
                 fileHash, fileName, totalBytes, deviceId, contentType,
                 fileTime, lastModified);
-            var planResp = await PostJsonAsync<PlanResponse>("/api/upload/plan", planReq, ct);
+
+            // ---- plan ----
+            PlanResponse planResp;
+            try
+            {
+                planResp = await PostPlanWithRetryAsync(planReq, progress, ct);
+            }
+            catch (System.OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;  // 用户取消，继续传播
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException(
+                    $"plan failed for {fileName}: {ex.Message}", ex);
+            }
 
             if (planResp.AlreadyComplete)
             {
@@ -145,22 +171,59 @@ public class FileUploader
                 return new UploadOutcome(planResp.FileId.Value, fileHash, Skipped: true);
             }
 
-            await using (var fs = new FileStream(localPath, FileMode.Open,
-                             FileAccess.Read, FileShare.Read, 81920, useAsync: true))
+            // ---- content（关键：过滤内部 OCE） ----
+            try
             {
-                using var content = new StreamContent(fs, 81920);
-                content.Headers.ContentType = new MediaTypeHeaderValue(
-                    string.IsNullOrEmpty(contentType) ? "application/octet-stream" : contentType);
-                content.Headers.ContentLength = totalBytes;
+                using var contentCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var timeout = TimeSpan.FromSeconds(60) +
+                              TimeSpan.FromSeconds(totalBytes / 1024 / 1024 * 2);
+                if (timeout > ContentUploadTimeout) timeout = ContentUploadTimeout;
+                contentCts.CancelAfter(timeout);
 
-                using var resp = await _http.PutAsync(
-                    $"/api/upload/{planResp.UploadId}/content", content, ct);
-                resp.EnsureSuccessStatusCode();
+                await using (var fs = new FileStream(localPath, FileMode.Open,
+                                 FileAccess.Read, FileShare.Read, 81920, useAsync: true))
+                {
+                    using var content = new StreamContent(fs, 81920);
+                    content.Headers.ContentType = new MediaTypeHeaderValue(
+                        string.IsNullOrEmpty(contentType) ? "application/octet-stream" : contentType);
+                    content.Headers.ContentLength = totalBytes;
+
+                    using var resp = await _http.PutAsync(
+                        $"/api/upload/{planResp.UploadId}/content", content, contentCts.Token);
+                    resp.EnsureSuccessStatusCode();
+                }
+            }
+            catch (System.OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;  // 用户取消
+            }
+            catch (System.OperationCanceledException)
+            {
+                // 内部 content CT 超时 → 转换为 TimeoutException
+                throw new TimeoutException($"content upload timeout for {fileName}");
+            }
+            catch (IOException ioex)
+            {
+                throw new IOException($"content upload I/O error for {fileName}: {ioex.Message}", ioex);
             }
             progress?.Report($"  已上传 {totalBytes} 字节: {fileName}");
 
-            var completeResp = await PostJsonAsync<CompleteResponse>(
-                $"/api/upload/{planResp.UploadId}/complete", null, ct);
+            // ---- complete ----
+            CompleteResponse completeResp;
+            try
+            {
+                completeResp = await PostCompleteWithRetryAsync(planResp.UploadId, progress, ct);
+            }
+            catch (System.OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException(
+                    $"complete failed for {fileName}: {ex.Message}", ex);
+            }
+
             return new UploadOutcome(completeResp.FileId, fileHash, Skipped: false);
         }
         finally
@@ -176,16 +239,84 @@ public class FileUploader
         }
     }
 
-    private async Task<T> PostJsonAsync<T>(string url, object? body, CancellationToken ct)
+    private async Task<PlanResponse> PostPlanWithRetryAsync(
+        PlanRequest req, IProgress<string>? progress, CancellationToken ct)
     {
-        using var req = new HttpRequestMessage(HttpMethod.Post, url);
-        if (body != null)
-            req.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+        Exception? lastEx = null;
 
-        using var resp = await _http.SendAsync(req, ct);
-        resp.EnsureSuccessStatusCode();
-        var json = await resp.Content.ReadAsStringAsync(ct);
-        return JsonSerializer.Deserialize<T>(json,
-            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            using var reqCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            reqCts.CancelAfter(ShortRequestTimeout);
+
+            try
+            {
+                using var httpReq = new HttpRequestMessage(HttpMethod.Post, "/api/upload/plan");
+                httpReq.Content = new StringContent(
+                    JsonSerializer.Serialize(req), Encoding.UTF8, "application/json");
+
+                using var resp = await _http.SendAsync(httpReq, reqCts.Token);
+                resp.EnsureSuccessStatusCode();
+                var json = await resp.Content.ReadAsStringAsync(reqCts.Token);
+                return JsonSerializer.Deserialize<PlanResponse>(json,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
+            }
+            catch (System.OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;  // 用户取消，穿透
+            }
+            catch (System.OperationCanceledException)
+            {
+                lastEx = new TimeoutException($"plan timeout after {ShortRequestTimeout.TotalSeconds}s");
+                if (attempt == 0) progress?.Report("  plan 超时，重试中...");
+            }
+            catch (HttpRequestException ex)
+            {
+                lastEx = ex;
+                if (attempt == 0) progress?.Report($"  plan 网络错误，重试中... ({ex.Message})");
+            }
+        }
+
+        throw lastEx ?? new InvalidOperationException("plan failed");
+    }
+
+    private async Task<CompleteResponse> PostCompleteWithRetryAsync(
+        Guid uploadId, IProgress<string>? progress, CancellationToken ct)
+    {
+        Exception? lastEx = null;
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            using var reqCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            reqCts.CancelAfter(ShortRequestTimeout);
+
+            try
+            {
+                using var httpReq = new HttpRequestMessage(HttpMethod.Post,
+                    $"/api/upload/{uploadId}/complete");
+
+                using var resp = await _http.SendAsync(httpReq, reqCts.Token);
+                resp.EnsureSuccessStatusCode();
+                var json = await resp.Content.ReadAsStringAsync(reqCts.Token);
+                return JsonSerializer.Deserialize<CompleteResponse>(json,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
+            }
+            catch (System.OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (System.OperationCanceledException)
+            {
+                lastEx = new TimeoutException($"complete timeout after {ShortRequestTimeout.TotalSeconds}s");
+                if (attempt == 0) progress?.Report("  complete 超时，重试中...");
+            }
+            catch (HttpRequestException ex)
+            {
+                lastEx = ex;
+                if (attempt == 0) progress?.Report($"  complete 网络错误，重试中... ({ex.Message})");
+            }
+        }
+
+        throw lastEx ?? new InvalidOperationException("complete failed");
     }
 }

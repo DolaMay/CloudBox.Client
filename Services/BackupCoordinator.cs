@@ -86,8 +86,15 @@ public class BackupCoordinator
                     if (outcome.Skipped) skipped++;
                     else uploaded++;
                 }
-                catch (Exception ex) when (ex is not System.OperationCanceledException)
+                catch (System.OperationCanceledException) when (ct.IsCancellationRequested)
                 {
+                    // 用户主动取消，穿透到 RunAsync 的 finally，最终被 Service 识别为「已取消」
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // 包括内部 OCE、TimeoutException、HttpRequestException、IOException
+                    // 全部记录为单个文件失败，继续处理下一个文件
                     failed++;
                     progress?.Report($"失败 {item.DisplayName}: {ex.Message}");
                 }
