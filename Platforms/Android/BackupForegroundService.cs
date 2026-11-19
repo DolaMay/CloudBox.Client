@@ -2,6 +2,7 @@ using Android.App;
 using Android.Content;
 using Android.OS;
 using AndroidX.Core.App;
+using CloudBox.Core.Services;
 using CloudBox.Client.Services;
 
 namespace CloudBox.Client.Platforms.Android;
@@ -37,11 +38,7 @@ public class BackupForegroundService : Service
         CreateNotificationChannel();
         StartForeground(NotificationId, BuildNotification("准备中..."));
 
-        if (_isRunning)
-        {
-            Log("already running, ignore start");
-            return StartCommandResult.NotSticky;
-        }
+        if (_isRunning) { Log("already running"); return StartCommandResult.NotSticky; }
 
         var baseUrl = AppSettingsStore.ServerUrl;
         var apiKey = AppSettingsStore.ApiKey;
@@ -57,7 +54,11 @@ public class BackupForegroundService : Service
         _cts = new CancellationTokenSource();
         var token = _cts.Token;
         var deviceFolder = AndroidDeviceInfoProvider.GetDeviceFolderName();
-        var coordinator = new BackupCoordinator(baseUrl, apiKey, deviceFolder);
+
+        var coordinator = new BackupCoordinator(
+            baseUrl, apiKey, deviceFolder,
+            new AndroidMediaScanner(),
+            new AndroidContentUploader());
 
         _ = Task.Run(async () =>
         {
@@ -80,7 +81,6 @@ public class BackupForegroundService : Service
             }
             catch (System.OperationCanceledException)
             {
-                // 内部 OCE 泄漏 —— 极罕见，不视为用户取消
                 summary = "内部错误（已停止）";
                 Log("WARNING: leaked OperationCanceledException without user cancel");
                 UpdateNotification(summary);
@@ -113,7 +113,6 @@ public class BackupForegroundService : Service
 
     public override void OnDestroy()
     {
-        // 关键诊断：如果这行日志出现在「自动取消」场景，说明系统杀掉了服务
         Log($"OnDestroy called, _isRunning={_isRunning}");
         WifiPerformanceLock.Release();
         try { _cts?.Cancel(); } catch { }
@@ -128,7 +127,6 @@ public class BackupForegroundService : Service
         if (!OperatingSystem.IsAndroidVersionAtLeast(26)) return;
         var nm = (NotificationManager?)GetSystemService(NotificationService);
         if (nm == null) return;
-
         var channel = new NotificationChannel(ChannelId, "CloudBox 备份",
             NotificationImportance.Low) { Description = "备份进度通知" };
         nm.CreateNotificationChannel(channel);
@@ -165,12 +163,6 @@ public class BackupForegroundService : Service
             .Build();
     }
 
-    private static void Log(string msg)
-    {
-#if ANDROID
+    private static void Log(string msg) =>
         global::Android.Util.Log.Debug("CloudBox", msg);
-#else
-        System.Diagnostics.Debug.WriteLine($"[CloudBox] {msg}");
-#endif
-    }
 }

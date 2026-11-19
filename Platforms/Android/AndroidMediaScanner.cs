@@ -1,24 +1,25 @@
-#if ANDROID
 using Android.Content;
 using Android.Provider;
-using CloudBox.Client.Models;
+using CloudBox.Core.Services;
 
-namespace CloudBox.Client.Services;
+namespace CloudBox.Client.Platforms.Android;
 
-public class AndroidMediaScanner
+public class AndroidMediaScanner : IMediaScanner
 {
-    public List<MediaItem> ScanPhotosAndVideos()
+    public Task<List<MediaItem>> ScanPhotosAndVideosAsync(CancellationToken ct = default)
     {
         var items = new List<MediaItem>();
-        var ctx = Android.App.Application.Context;
+        var ctx = global::Android.App.Application.Context;
 
-        ScanCollection(ctx, MediaStore.Images.Media.ExternalContentUri, "image/", items);
-        ScanCollection(ctx, MediaStore.Video.Media.ExternalContentUri, "video/", items);
+        ScanCollection(ctx, MediaStore.Images.Media.ExternalContentUri, "image/", items, ct);
+        ScanCollection(ctx, MediaStore.Video.Media.ExternalContentUri, "video/", items, ct);
 
-        return items;
+        return Task.FromResult(items);
     }
 
-    private void ScanCollection(Context ctx, Android.Net.Uri collection, string mimePrefix, List<MediaItem> output)
+    private void ScanCollection(
+        Context ctx, global::Android.Net.Uri collection,
+        string mimePrefix, List<MediaItem> output, CancellationToken ct)
     {
         var projection = new[]
         {
@@ -45,11 +46,14 @@ public class AndroidMediaScanner
 
         while (cursor.MoveToNext())
         {
+            ct.ThrowIfCancellationRequested();
+
             var id = cursor.GetLong(idCol);
             var mime = cursor.GetString(mimeCol) ?? "";
             if (!mime.StartsWith(mimePrefix)) continue;
 
-            var uri = Android.Net.Uri.WithAppendedPath(collection, id.ToString());
+            var uri = global::Android.Net.Uri.WithAppendedPath(collection, id.ToString());
+
             DateTimeOffset? takenAt = null;
             if (dateTakenCol >= 0 && !cursor.IsNull(dateTakenCol))
             {
@@ -57,26 +61,20 @@ public class AndroidMediaScanner
                 if (ms > 0)
                     takenAt = DateTimeOffset.FromUnixTimeMilliseconds(ms).ToLocalTime();
             }
+
+            var capturedUri = uri;
             output.Add(new MediaItem
             {
-                ContentUri = uri.ToString(),
+                Id = uri.ToString(),
                 DisplayName = cursor.GetString(nameCol) ?? $"file_{id}",
                 Size = cursor.GetLong(sizeCol),
-                LastModified = DateTimeOffset.FromUnixTimeSeconds(cursor.GetLong(dateCol)).ToLocalTime(),
+                LastModified = DateTimeOffset.FromUnixTimeSeconds(
+                    cursor.GetLong(dateCol)).ToLocalTime(),
+                TakenAt = takenAt,
                 ContentType = mime,
-                TakenAt = takenAt
+                OpenStream = () => global::Android.App.Application.Context
+                    .ContentResolver!.OpenInputStream(capturedUri)!
             });
         }
     }
 }
-
-public class MediaItem
-{
-    public DateTimeOffset? TakenAt { get; set; }
-    public string ContentUri { get; set; } = "";
-    public string DisplayName { get; set; } = "";
-    public long Size { get; set; }
-    public DateTimeOffset LastModified { get; set; }
-    public string ContentType { get; set; } = "";
-}
-#endif

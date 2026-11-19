@@ -1,11 +1,9 @@
 using System.Collections.Concurrent;
 using Makaretu.Dns;
-#if ANDROID
 using Android.Content;
 using Android.Net.Wifi;
-#endif
 
-namespace CloudBox.Client.Services;
+namespace CloudBox.Client.Platforms.Android;
 
 public class MdnsDiscovery
 {
@@ -18,11 +16,10 @@ public class MdnsDiscovery
         using var mdns = new MulticastService();
         using var sd = new ServiceDiscovery(mdns);
 
-#if ANDROID
         WifiManager.MulticastLock? multicastLock = null;
         try
         {
-            var ctx = Android.App.Application.Context;
+            var ctx = global::Android.App.Application.Context;
             var wifi = (WifiManager?)ctx.GetSystemService(Context.WifiService);
             multicastLock = wifi?.CreateMulticastLock("CloudBoxMdnsLock");
             multicastLock?.SetReferenceCounted(false);
@@ -33,7 +30,6 @@ public class MdnsDiscovery
         {
             Log($"MulticastLock failed: {ex.Message}");
         }
-#endif
 
         try
         {
@@ -100,7 +96,6 @@ public class MdnsDiscovery
         finally
         {
             try { mdns.Stop(); } catch { }
-#if ANDROID
             try
             {
                 multicastLock?.Release();
@@ -108,18 +103,11 @@ public class MdnsDiscovery
                 Log("MulticastLock released");
             }
             catch { }
-#endif
         }
 
         return results.Values.ToList();
     }
 
-    private static void Log(string msg)
-    {
-#if ANDROID
+    private static void Log(string msg) =>
         global::Android.Util.Log.Debug("CloudBox", msg);
-#else
-        System.Diagnostics.Debug.WriteLine($"[CloudBox] {msg}");
-#endif
-    }
 }

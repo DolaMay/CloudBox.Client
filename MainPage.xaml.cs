@@ -1,6 +1,8 @@
 ﻿using CloudBox.Client.Services;
 #if ANDROID
 using CloudBox.Client.Platforms.Android;
+#elif IOS
+using CloudBox.Client.Platforms.iOS;
 #endif
 
 namespace CloudBox.Client;
@@ -10,7 +12,7 @@ public partial class MainPage : ContentPage
 #if ANDROID
     private IDispatcherTimer? _stateTimer;
     private bool _cancelRequested;
-    private bool? _lastRunningState;   // ← 新增：上一次采样到的运行状态
+    private bool? _lastRunningState;
 #endif
 
     public MainPage()
@@ -42,20 +44,15 @@ public partial class MainPage : ContentPage
 #endif
     }
 
+#if ANDROID
     private void RefreshUiState()
     {
-#if ANDROID
         var running = BackupServiceStarter.IsRunning;
-
-        // 按钮状态每次都刷（无害，保证 UI 和 Service 状态一致）
         BackupButton.IsEnabled = !running;
         CancelButton.IsEnabled = running;
         DiscoverButton.IsEnabled = !running;
 
-        // StatusLabel 只在「运行状态变化」时更新，避免覆盖 mDNS 发现等临时消息
-        if (_lastRunningState == running)
-            return;
-
+        if (_lastRunningState == running) return;
         _lastRunningState = running;
 
         if (running)
@@ -66,9 +63,7 @@ public partial class MainPage : ContentPage
             return;
         }
 
-        // 刚刚从 running → idle
         _cancelRequested = false;
-
         var lastResult = Preferences.Default.Get("last_backup_result", "");
         var lastTimeStr = Preferences.Default.Get("last_backup_time", "");
         if (!string.IsNullOrEmpty(lastResult) && !string.IsNullOrEmpty(lastTimeStr) &&
@@ -77,10 +72,8 @@ public partial class MainPage : ContentPage
             var local = lastTime.ToLocalTime().ToString("MM-dd HH:mm");
             StatusLabel.Text = $"上次备份 {local}: {lastResult}";
         }
-        // 没有备份记录时保持现状：首次启动 StatusLabel 本来是空的，
-        // 用户如果在点「自动发现」，StatusLabel 里是发现结果，不要覆盖
-#endif
     }
+#endif
 
     private async void OnBackupClicked(object sender, EventArgs e)
     {
@@ -145,11 +138,10 @@ public partial class MainPage : ContentPage
 
         if (PowerSaveModeHelper.IsPowerSaveMode())
         {
-            var cont = await DisplayAlert(
-                "当前为省电模式",
-                "省电模式会限制 Wi-Fi 性能，备份过程中可能出现偶发卡顿或文件上传失败。\n\n" +
-                "CloudBox 会在备份期间自动持有 Wi-Fi 高性能锁缓解这个问题，" +
-                "但如果网络仍然不稳定，建议关闭省电模式后再备份。",
+            var cont = await DisplayAlert("当前为省电模式",
+                "省电模式会限制 Wi-Fi 性能，备份过程中可能出现偶发卡顿。\n\n" +
+                "CloudBox 会在备份期间自动持有 Wi-Fi 高性能锁缓解，" +
+                "如网络仍不稳定建议关闭省电模式后再备份。",
                 "继续备份", "去关闭省电");
             if (!cont)
             {
@@ -162,30 +154,25 @@ public partial class MainPage : ContentPage
         Preferences.Default.Remove("last_backup_result");
         Preferences.Default.Remove("last_backup_time");
         _cancelRequested = false;
-
+        _lastRunningState = null;
         StatusLabel.Text = "备份已启动，可息屏或切换应用";
         BackupServiceStarter.Start();
-        // 不立即调 RefreshUiState：让 1 秒后的定时器采样到 running=true，
-        // 把 StatusLabel 平滑切换为「备份进行中」，不需要覆盖用户刚看到的「备份已启动」
-#else
-        BackupButton.IsEnabled = false;
-        CancelButton.IsEnabled = true;
-        StatusLabel.Text = "备份进行中...";
-        try
+#elif IOS
+        if (IOSBackupService.IsRunning)
         {
-            var deviceName = DeviceInfo.Name ?? "device";
-            var coordinator = new BackupCoordinator(baseUrl, apiKey, deviceName);
-            var progress = new Progress<string>(msg =>
-                MainThread.BeginInvokeOnMainThread(() => StatusLabel.Text = msg));
-            var result = await coordinator.RunAsync(progress, CancellationToken.None);
-            StatusLabel.Text =
-                $"完成：上传 {result.Uploaded}，跳过 {result.Skipped}，失败 {result.Failed}";
+            StatusLabel.Text = "备份已经在运行中";
+            return;
         }
-        finally
+
+        var granted = await IOSPermissionHelper.RequestPhotoLibraryAccessAsync();
+        if (!granted)
         {
-            BackupButton.IsEnabled = true;
-            CancelButton.IsEnabled = false;
+            StatusLabel.Text = "未获得相册访问权限，无法备份";
+            return;
         }
+
+        StatusLabel.Text = "备份已启动，可切到后台（上传会继续）";
+        IOSBackupService.Start();
 #endif
     }
 
@@ -194,6 +181,10 @@ public partial class MainPage : ContentPage
 #if ANDROID
         _cancelRequested = true;
         BackupServiceStarter.Cancel();
+        StatusLabel.Text = "正在取消…";
+        CancelButton.IsEnabled = false;
+#elif IOS
+        IOSBackupService.Cancel();
         StatusLabel.Text = "正在取消…";
         CancelButton.IsEnabled = false;
 #endif
@@ -208,26 +199,35 @@ public partial class MainPage : ContentPage
         {
             var servers = await MdnsDiscovery.DiscoverAsync(
                 TimeSpan.FromSeconds(5), CancellationToken.None);
-
             if (servers.Count == 0)
             {
                 StatusLabel.Text = "未发现服务器。请确认手机和 PC 在同一 Wi-Fi，且 PC 端已启动。";
                 return;
             }
-
             var first = servers[0];
             ServerUrlEntry.Text = $"http://{first.Host}:{first.Port}";
             StatusLabel.Text = $"已发现: {first.Name} ({first.Host}:{first.Port})。";
         }
-        catch (Exception ex)
+        catch (Exception ex) { StatusLabel.Text = $"发现失败: {ex.Message}"; }
+        finally { DiscoverButton.IsEnabled = !BackupServiceStarter.IsRunning; }
+#elif IOS
+        DiscoverButton.IsEnabled = false;
+        StatusLabel.Text = "正在扫描局域网内的 CloudBox 服务...";
+        try
         {
-            StatusLabel.Text = $"发现失败: {ex.Message}";
+            var servers = await IOSMdnsDiscovery.DiscoverAsync(
+                TimeSpan.FromSeconds(5), CancellationToken.None);
+            if (servers.Count == 0)
+            {
+                StatusLabel.Text = "未发现服务器。请确认 iPhone 和 PC 在同一 Wi-Fi，且 PC 端已启动。";
+                return;
+            }
+            var first = servers[0];
+            ServerUrlEntry.Text = $"http://{first.Host}:{first.Port}";
+            StatusLabel.Text = $"已发现: {first.Name} ({first.Host}:{first.Port})。";
         }
-        finally
-        {
-            // 按钮状态同步：只刷按钮，不覆盖 StatusLabel
-            RefreshUiState();
-        }
+        catch (Exception ex) { StatusLabel.Text = $"发现失败: {ex.Message}"; }
+        finally { DiscoverButton.IsEnabled = !IOSBackupService.IsRunning; }
 #endif
     }
 }
