@@ -34,7 +34,14 @@ public class IOSMediaScanner : IMediaScanner
             var isVideo = asset.MediaType == PHAssetMediaType.Video;
 
             long size = 0;
-            try { size = (long)resource.DataSize; } catch { }
+            try
+            {
+                // DataSize 是 iOS 27+ 的 API；这里用 KVC 兼容 iOS 15–26
+                var sizeObj = resource.ValueForKey((NSString)"fileSize");
+                if (sizeObj != null)
+                    size = sizeObj.LongValue;
+            }
+            catch { /* 某些资源可能取不到大小，保持 0 */ }
 
             var localId = asset.LocalIdentifier;
             var phAsset = asset;
