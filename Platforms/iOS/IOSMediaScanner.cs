@@ -36,10 +36,10 @@ public class IOSMediaScanner : IMediaScanner
             long size = 0;
             try
             {
-                // DataSize 是 iOS 27+ 的 API；这里用 KVC 兼容 iOS 15–26
-                var sizeObj = resource.ValueForKey((NSString)"fileSize");
-                if (sizeObj != null)
-                    size = sizeObj.LongValue;
+                // ValueForKey 返回 NSObject，需要先转成 NSNumber 才能读数值
+                var sizeNum = resource.ValueForKey((NSString)"fileSize") as NSNumber;
+                if (sizeNum != null)
+                    size = sizeNum.LongValue.ToInt64();
             }
             catch { /* 某些资源可能取不到大小，保持 0 */ }
 
